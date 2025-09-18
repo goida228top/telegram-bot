@@ -1,0 +1,14 @@
+
+# Временные файлы и логи
+*.log
+downloaded_photo_*.jpg
+answer.html
+
+# Виртуальное окружение Python
+venv/
+
+# Файл с секретами
+secrets.env
+
+# Файл самого скрипта
+git_watcher.sh
