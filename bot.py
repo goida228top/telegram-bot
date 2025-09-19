@@ -6,7 +6,7 @@ import base64
 import asyncio
 import httpx
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler, PreCheckoutQueryHandler
 from dotenv import load_dotenv
 from telegram.error import RetryAfter, NetworkError, BadRequest
 from PIL import Image
@@ -35,6 +35,8 @@ from pptx.enum.text import MSO_ANCHOR, MSO_AUTO_SIZE # Добавлено для
 load_dotenv('secrets.env')
 
 # Настройка логирования
+# Уровень логирования можно изменить здесь:
+# logging.INFO (стандартный), logging.DEBUG (очень подробный)
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
@@ -62,8 +64,12 @@ MAX_HISTORY_MESSAGES = 10
 
 # Словари для хранения данных по пользователям
 user_history = {}
-user_settings = defaultdict(lambda: {"response_format": "html"})
+# Единый словарь для всех настроек пользователя, включая кредиты.
+# Это гарантирует, что все функции будут обращаться к одному и тому же состоянию.
+user_settings = defaultdict(lambda: {"response_format": "html", "html_credits": 0})
 media_groups = {} # Словарь для временного хранения медиагрупп
+# ВАЖНО: Переключатель для тестового режима. Установи в False для реальных платежей.
+IS_TEST_MODE = True
 
 # CSS-стили для тетрадей
 NOTEBOOK_STYLES = """
@@ -207,6 +213,7 @@ async def get_next_api_key():
     global key_index
     api_key = GEMINI_API_KEYS[key_index]
     key_index = (key_index + 1) % len(GEMINI_API_KEYS)
+    LOGGER.info(f"Переключение на API ключ с индексом {key_index - 1}.")
     return api_key
 
 async def call_gemini_api(payload: dict) -> str:
@@ -216,8 +223,11 @@ async def call_gemini_api(payload: dict) -> str:
         while retries < MAX_RETRIES:
             api_key = await get_next_api_key()
             api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key={api_key}"
+            LOGGER.info(f"Попытка {retries + 1}/{MAX_RETRIES} с API ключом {key_index}.")
+            LOGGER.debug(f"Payload для Gemini API: {json.dumps(payload, indent=2)}")
             try:
                 async with session.post(api_url, json=payload, timeout=300.0) as response:
+                    LOGGER.info(f"Ответ от Gemini API: HTTP {response.status}")
                     if response.status == 400:
                         error_text = await response.text()
                         if "API key not valid" in error_text:
@@ -231,13 +241,14 @@ async def call_gemini_api(payload: dict) -> str:
                     response.raise_for_status()
                     result = await response.json()
                     text_content = result.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text', 'Не удалось получить ответ.')
+                    LOGGER.info("Успешный ответ от Gemini API.")
                     return text_content
             except aiohttp.ClientResponseError as e:
+                LOGGER.error(f"HTTP error during Gemini API request: {e.status} - {e.message}")
                 if e.status == 429:
                     LOGGER.warning("Rate limit exceeded for Gemini API. Switching to next key...")
                     retries += 1
                 else:
-                    LOGGER.error(f"HTTP error during Gemini API request: {e}")
                     retries += 1
                     await asyncio.sleep(RETRY_DELAY * (2 ** retries))
             except aiohttp.ClientError as e:
@@ -247,13 +258,18 @@ async def call_gemini_api(payload: dict) -> str:
             except Exception as e:
                 LOGGER.error(f"Unknown error: {e}")
                 return "Извините, произошла ошибка."
+        LOGGER.error("Не удалось получить ответ от нейросети после нескольких попыток.")
         return "Извините, не удалось получить ответ от нейросети после нескольких попыток."
 
 async def send_html_file(update: Update, html_code: str):
     """Creates and sends an HTML file from the generated code."""
+    LOGGER.info("Начало отправки HTML-файла.")
     try:
-        if len(html_code.encode('utf-8')) > 50 * 1024 * 1024:
+        file_size_bytes = len(html_code.encode('utf-8'))
+        LOGGER.info(f"Размер генерируемого HTML-файла: {file_size_bytes} байт.")
+        if file_size_bytes > 50 * 1024 * 1024:
             await update.message.reply_text("Извините, сгенерированный файл слишком большой для отправки в Telegram.")
+            LOGGER.warning(f"Файл слишком большой для отправки: {file_size_bytes} байт.")
             return
 
         await update.message.reply_document(
@@ -276,6 +292,7 @@ async def create_and_send_pptx_file(update: Update, slides_data: list):
     Создает PowerPoint-презентацию из JSON-данных с улучшенным дизайном.
     Использует новые настройки для цветов, шрифтов и макета.
     """
+    LOGGER.info("Начало создания и отправки PPTX-файла.")
     prs = Presentation()
 
     # Настройка цветов и стилей
@@ -285,6 +302,7 @@ async def create_and_send_pptx_file(update: Update, slides_data: list):
     ACCENT_COLOR = RGBColor(52, 152, 219) # Голубой
 
     for slide_info in slides_data:
+        LOGGER.debug(f"Обработка слайда: {slide_info.get('title', 'Без заголовка')}")
         # Выбор макета для слайда с заголовком и списком
         slide_layout = prs.slide_layouts[1]
         slide = prs.slides.add_slide(slide_layout)
@@ -362,6 +380,7 @@ async def create_and_send_pptx_file(update: Update, slides_data: list):
     finally:
         # Удаление временного файла
         os.remove(filepath)
+        LOGGER.info(f"Временный файл {filepath} удален.")
 
 # --- Обработчики команд и сообщений ---
 
@@ -369,6 +388,7 @@ async def create_and_send_pptx_file(update: Update, slides_data: list):
 async def start_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Отправляет приветственное сообщение с меню в виде кнопок."""
     user_id = update.effective_user.id
+    LOGGER.info(f"Пользователь {user_id} отправил команду /start.")
     if user_id in user_history:
         del user_history[user_id]
     
@@ -388,23 +408,60 @@ async def start_command_handler(update: Update, context: ContextTypes.DEFAULT_TY
     keyboard = [
         [InlineKeyboardButton("Начать чат", callback_data='start_chat')],
         [InlineKeyboardButton("Настройки", callback_data='settings')],
-        [InlineKeyboardButton("Донат", url='https://www.donationalerts.com/')]
+        [InlineKeyboardButton("Донат", callback_data='donate')] # Изменено на новый обработчик
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     await update.message.reply_text(welcome_message, reply_markup=reply_markup)
     LOGGER.info(f"Пользователь {user_id} начал чат.")
 
+# НОВОЕ: Обработчик команды /donate
+async def donate_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отправляет меню для доната."""
+    user_id = update.effective_user.id
+    LOGGER.info(f"Пользователь {user_id} отправил команду /donate.")
+    
+    message = "Спасибо за вашу поддержку! Выберите, сколько звёзд вы хотите купить. За каждую звезду вы получите 10 ответов."
+    keyboard = [
+        [InlineKeyboardButton("1 ⭐️", callback_data='buy_stars_1')],
+        [InlineKeyboardButton("5 ⭐️", callback_data='buy_stars_5')],
+        [InlineKeyboardButton("10 ⭐️", callback_data='buy_stars_10')],
+        [InlineKeyboardButton("Назад", callback_data='settings')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    if update.callback_query:
+        await update.callback_query.edit_message_text(message, reply_markup=reply_markup)
+    else:
+        await update.message.reply_text(message, reply_markup=reply_markup)
+    LOGGER.info(f"Меню доната отправлено пользователю {user_id}.")
+
+
 # Обработчик команды /reset
 async def reset_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Очищает историю диалога для текущего пользователя."""
     user_id = update.effective_user.id
+    LOGGER.info(f"Пользователь {user_id} отправил команду /reset.")
     if user_id in user_history:
         del user_history[user_id]
-        await update.message.reply_text("Диалог сброшен. Можете начинать новую беседу.")
-        LOGGER.info(f"Диалог пользователя {user_id} сброшен.")
+        LOGGER.info(f"История диалога для пользователя {user_id} очищена.")
+    await update.message.reply_text("Диалог сброшен. Можете начинать новую беседу.")
+
+# НОВАЯ функция для тестирования: выдает кредиты
+async def get_stars_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Добавляет 5 кредитов для тестирования."""
+    user_id = update.effective_user.id
+    LOGGER.info(f"Пользователь {user_id} отправил команду /get_stars.")
+    if IS_TEST_MODE:
+        user_settings[user_id]["html_credits"] += 5
+        LOGGER.info(f"Добавлено 5 кредитов пользователю {user_id}. Текущий баланс: {user_settings[user_id]['html_credits']}")
+        await update.message.reply_text(
+            f"✅ **Режим тестирования:** Вам добавлено 5 кредитов. Теперь вы можете генерировать HTML-ответы."
+            f"\n\n**Текущий баланс:** {user_settings[user_id]['html_credits']} кредитов."
+        )
     else:
-        await update.message.reply_text("Диалог не найден. Начните новую беседу.")
+        LOGGER.info("Команда /get_stars была вызвана в не-тестовом режиме.")
+        await update.message.reply_text("Эта команда доступна только в режиме тестирования.")
 
 # Обработчик кнопок
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -412,16 +469,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
+    LOGGER.info(f"Пользователь {user_id} нажал кнопку: {query.data}")
 
     if query.data == 'start_chat':
         await query.edit_message_text("Отлично, можете присылать ваши задания. Чтобы начать заново, используйте команду /start.")
     elif query.data == 'settings':
         keyboard = [
             [InlineKeyboardButton("Способ отправки", callback_data='settings_send_method')],
+            [InlineKeyboardButton("Купить ответы (10 за 1⭐️)", callback_data='donate')], # Изменено, ведёт в новое меню доната
             [InlineKeyboardButton("Назад", callback_data='start_chat')]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text("Выберите, как мне отвечать:", reply_markup=reply_markup)
+    elif query.data == 'donate':
+        await donate_command_handler(update, context) # Новый вызов
+    elif query.data.startswith('buy_stars_'):
+        stars_cost = int(query.data.split('_')[2])
+        LOGGER.info(f"Пользователь {user_id} инициировал покупку {stars_cost} звёзд.")
+        await send_invoice(update, context, stars_cost)
     elif query.data == 'settings_send_method':
         keyboard = [
             [InlineKeyboardButton("HTML (файл)", callback_data='format_html')],
@@ -434,21 +499,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     elif query.data.startswith('format_'):
         response_format = query.data.split('_')[1]
         user_settings[user_id]["response_format"] = response_format
+        LOGGER.info(f"Формат ответа для пользователя {user_id} изменен на: {response_format}")
         await query.edit_message_text(f"Отлично! Теперь я буду отвечать в формате **{response_format.upper()}**. Чтобы изменить, зайдите в /settings.")
 
-# Новая логика для обработки медиагрупп
-# Используем defaultdict для удобства и таймер для обработки альбомов
 async def process_media_group(media_group_id, user_id, context):
     """
     Ждет небольшое время, чтобы убедиться, что все сообщения из медиагруппы получены,
     затем обрабатывает их.
     """
+    LOGGER.info(f"Получена медиагруппа с ID: {media_group_id} от пользователя {user_id}. Ожидание...")
     await asyncio.sleep(2) # Ждем 2 секунды, чтобы собрать все фото
     
     if media_group_id not in media_groups:
+        LOGGER.warning(f"Медиагруппа {media_group_id} уже была обработана или не найдена.")
         return # Если медиагруппа уже обработана, выходим
 
     messages = media_groups.pop(media_group_id)["messages"]
+    LOGGER.info(f"Собрано {len(messages)} сообщений из медиагруппы {media_group_id}. Начало обработки.")
     
     await context.bot.send_message(user_id, "⌛ Обрабатываю ваш альбом...")
     
@@ -499,10 +566,75 @@ async def process_media_group(media_group_id, user_id, context):
         LOGGER.error(f"Ошибка при обработке медиагруппы: {e}")
         await context.bot.send_message(user_id, "Извините, произошла ошибка при обработке альбома.")
 
+# Изменено: теперь принимает stars_cost
+async def send_invoice(update: Update, context: ContextTypes.DEFAULT_TYPE, stars_cost: int) -> None:
+    """Создаёт и отправляет счёт для оплаты Telegram Stars."""
+    user_id = update.effective_user.id
+    
+    invoice_payload = f"html_purchase_{stars_cost}" # Уникальный идентификатор платежа с количеством звёзд
+    title = f"Покупка {stars_cost} звёзд"
+    description = f"Получите {stars_cost * 10} ответов в формате HTML."
+    
+    try:
+        await context.bot.send_invoice(
+            chat_id=user_id,
+            title=title,
+            description=description,
+            payload=invoice_payload,
+            provider_token="", # Оставляем пустым, так как это Telegram Stars
+            currency="XTR", # "XTR" - код валюты для Telegram Stars
+            prices=[{"label": f"{stars_cost} звезда" if stars_cost == 1 else f"{stars_cost} звёзд", "amount": stars_cost}],
+            start_parameter="html_purchase", # Уникальный параметр
+            need_name=False,
+            need_shipping_address=False
+        )
+        LOGGER.info(f"Счёт для оплаты {stars_cost} звёзд отправлен пользователю {user_id}")
+    except Exception as e:
+        LOGGER.error(f"Ошибка при отправке счёта: {e}")
+        await context.bot.send_message(user_id, "Извините, не удалось создать счёт для оплаты.")
+
+# НОВЫЙ обработчик для pre_checkout_query
+async def pre_checkout_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обрабатывает pre-checkout запросы от Telegram."""
+    query = update.pre_checkout_query
+    LOGGER.info(f"Получен pre_checkout_query от {query.from_user.id}. Payload: {query.invoice_payload}")
+
+    # Проверяем, что payload начинается с нужного префикса
+    if query.invoice_payload.startswith("html_purchase_"):
+        await query.answer(ok=True)
+        LOGGER.info(f"Pre_checkout_query успешно подтвержден для пользователя {query.from_user.id}")
+    else:
+        await query.answer(ok=False, error_message="Извините, мы не можем обработать этот платёж.")
+        LOGGER.warning(f"Неизвестный payload в pre_checkout_query от {query.from_user.id}")
+
+async def successful_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обрабатывает успешную оплату и выдаёт "кредиты"."""
+    user_id = update.effective_user.id
+    payload = update.effective_message.successful_payment.invoice_payload
+    
+    LOGGER.info(f"Получен успешный платёж от пользователя {user_id}. Payload: {payload}")
+    
+    if payload.startswith("html_purchase_"):
+        try:
+            stars_bought = int(payload.split('_')[2])
+            credits_to_add = stars_bought * 10 # 10 ответов за каждую звезду
+            
+            # Увеличиваем "баланс" пользователя
+            user_settings[user_id]["html_credits"] += credits_to_add
+            LOGGER.info(f"Баланс пользователя {user_id} увеличен на {credits_to_add}. Текущий баланс: {user_settings[user_id]['html_credits']}")
+            
+            await update.effective_message.reply_text(f"✅ Оплата прошла успешно! Вам зачислено {credits_to_add} кредитов. Теперь вы можете получить ответы в формате HTML. Пожалуйста, отправьте мне ваше задание.")
+        except (IndexError, ValueError) as e:
+            LOGGER.error(f"Не удалось распарсить payload {payload}: {e}")
+            await update.effective_message.reply_text("Извините, произошла ошибка при зачислении кредитов. Пожалуйста, свяжитесь с администратором.")
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Универсальный обработчик для текста, фото и файлов."""
     
     user_id = update.effective_user.id
+    LOGGER.info(f"Получено сообщение от пользователя {user_id}.")
+    
+    response_format = user_settings[user_id].get("response_format", "html")
     
     if update.message.media_group_id:
         media_group_id = update.message.media_group_id
@@ -520,13 +652,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await update.message.reply_text("⌛ Обрабатываю ваш запрос...")
-    
+    # Проверяем, нужно ли обрабатывать как HTML-файл и есть ли "кредиты"
+    if response_format == "html":
+        credits = user_settings[user_id].get("html_credits", 0)
+        LOGGER.info(f"Пользователь {user_id} запросил HTML-формат. Текущий баланс: {credits}")
+        
+        # Этот блок кода проверяет, достаточно ли кредитов у пользователя для получения ответа.
+        # Если у пользователя 1 или более кредит, условие "credits <= 0" будет ложным,
+        # и бот продолжит работу. Если кредитов 0, бот попросит оплату.
+        if credits <= 0:
+            LOGGER.info(f"У пользователя {user_id} недостаточно кредитов. Отправка предложения о покупке.")
+            await update.message.reply_text(
+                "Чтобы получить ответ в формате HTML, у вас должен быть как минимум 1 кредит. Вы можете купить их в меню: /donate.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Перейти в меню доната", callback_data='donate')]
+                ])
+            )
+            return
+        
+        # Если "кредит" есть, уменьшаем его на 1 перед началом генерации
+        user_settings[user_id]["html_credits"] -= 1
+        LOGGER.info(f"1 кредит использован. Новый баланс для {user_id}: {user_settings[user_id]['html_credits']}")
+        await update.message.reply_text(f"⏳ Использую 1 «кредит». Осталось: {user_settings[user_id]['html_credits']}. Обрабатываю ваш запрос...")
+    else:
+        LOGGER.info(f"Пользователь {user_id} запросил формат: {response_format}. Обрабатываю запрос.")
+        await update.message.reply_text("⏳ Обрабатываю ваш запрос...")
+        
     if user_id not in user_history:
         user_history[user_id] = []
+        LOGGER.debug(f"Инициализирована новая история для пользователя {user_id}.")
 
     while len(user_history[user_id]) >= MAX_HISTORY_MESSAGES:
         user_history[user_id].pop(0)
+        LOGGER.debug("Удалено самое старое сообщение из истории диалога.")
 
     contents = [{ "role": "user", "parts": [{ "text": DEVELOPER_PROMPT }]}]
     for item in user_history[user_id]:
@@ -534,6 +692,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if update.message.document:
         document = update.message.document
+        LOGGER.info(f"Получен документ от {user_id}: {document.file_name}, MIME-тип: {document.mime_type}")
         file_info = {
             'file_id': document.file_id,
             'file_name': document.file_name,
@@ -543,6 +702,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_content = await file.download_as_bytearray()
         
         if file_info['mime_type'].startswith('image/'):
+            LOGGER.info(f"Документ идентифицирован как изображение. Размер: {len(file_content)} байт.")
             try:
                 img = Image.open(io.BytesIO(file_content))
                 img_rgb = img.convert("RGB")
@@ -569,6 +729,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
         
         elif file_info['mime_type'].startswith('text/') or file_info['file_name'].lower().endswith(('.py', '.txt', '.html', '.md')):
+            LOGGER.info(f"Документ идентифицирован как текстовый файл.")
             try:
                 decoded_content = file_content.decode('utf-8')
                 text_prompt = update.message.caption if update.message.caption else ""
@@ -576,16 +737,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "role": "user",
                     "parts": [{ "text": f"{text_prompt}\n\nСодержимое файла:\n\n{decoded_content}"}]
                 })
+                LOGGER.debug("Содержимое текстового файла успешно декодировано.")
             except UnicodeDecodeError:
                 LOGGER.error("Не удалось декодировать файл. Возможно, это бинарный файл.")
                 await update.message.reply_text("Извините, не удалось прочитать этот файл как текст.")
                 return
         else:
+            LOGGER.warning(f"Получен неподдерживаемый тип файла: {file_info['mime_type']}.")
             await update.message.reply_text("Извините, этот тип файла не поддерживается.")
             return
             
     elif update.message.photo:
         photo = update.message.photo[-1]
+        LOGGER.info(f"Получена фотография от {user_id}. File ID: {photo.file_id}")
         file = await context.bot.get_file(photo.file_id)
         file_content = await file.download_as_bytearray()
         
@@ -609,6 +773,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     }
                 ]
             })
+            LOGGER.info("Фотография успешно обработана и добавлена в запрос.")
         except Exception as e:
             LOGGER.error(f"Ошибка при обработке фотографии: {e}")
             await update.message.reply_text("Извините, произошла ошибка при обработке фотографии.")
@@ -616,6 +781,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif update.message.text:
         text_prompt = update.message.text
+        LOGGER.info(f"Получен текстовый запрос от {user_id}: '{text_prompt}'")
         contents.append({
             "role": "user",
             "parts": [{"text": text_prompt}]
@@ -624,15 +790,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Пожалуйста, предоставьте текст, фотографию или файл, чтобы я мог помочь.")
         return
 
-    # Определяем формат ответа из настроек пользователя
-    response_format = user_settings[user_id]["response_format"]
-
     try:
         if response_format == "html":
             payload = {
                 "contents": contents,
                 "generationConfig": {"temperature": 0.4}
             }
+            LOGGER.info("Отправка запроса в Gemini API для генерации HTML.")
             gemini_response = await call_gemini_api(payload)
             
             user_history[user_id].append({
@@ -643,6 +807,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_html_file(update, gemini_response)
 
         elif response_format == "presentation":
+            LOGGER.info("Отправка запроса в Gemini API для генерации презентации (JSON).")
             # Change the prompt and force JSON output for presentation mode
             contents[0]["parts"][0]["text"] = PRESENTATION_PROMPT
             
@@ -672,12 +837,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             try:
                 slides_data = json.loads(gemini_json_response)
+                LOGGER.info("JSON для презентации успешно разобран.")
                 await create_and_send_pptx_file(update, slides_data)
             except json.JSONDecodeError as e:
                 LOGGER.error(f"Failed to parse JSON from Gemini API: {e}")
                 await update.message.reply_text("Извините, произошла ошибка при обработке данных для презентации. Пожалуйста, попробуйте снова.")
 
         elif response_format == "text":
+            LOGGER.info("Отправка запроса в Gemini API для генерации обычного текста.")
             payload = {
                 "contents": contents,
                 "generationConfig": {"temperature": 0.4}
@@ -719,7 +886,13 @@ def main() -> None:
     # Команды и кнопки
     application.add_handler(CommandHandler("start", start_command_handler))
     application.add_handler(CommandHandler("reset", reset_command_handler))
+    application.add_handler(CommandHandler("get_stars", get_stars_handler)) # НОВАЯ КОМАНДА
+    application.add_handler(CommandHandler("donate", donate_command_handler)) # НОВАЯ КОМАНДА
     application.add_handler(CallbackQueryHandler(button_handler))
+    
+    # ОБРАБОТЧИКИ ДЛЯ ПЛАТЕЖЕЙ
+    application.add_handler(PreCheckoutQueryHandler(pre_checkout_query_handler)) # НОВЫЙ ОБРАБОТЧИК
+    application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback)) # Уже был, но я его выделил
     
     # Универсальный обработчик для всех сообщений (текст, фото, файлы)
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
@@ -731,3 +904,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
